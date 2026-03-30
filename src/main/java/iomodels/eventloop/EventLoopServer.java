@@ -14,7 +14,7 @@ import java.util.Iterator;
  * Models Node.js / libuv architecture including its key failure mode:
  * a slow handler (SLOW_PING) blocks ALL other connections for 1 second.
  *
- * Client #2 sends "SLOW_PING". Watch timestamps — other clients' responses
+ * Client-1 sends "SLOW_PING". Watch timestamps — other clients' responses
  * are delayed by the full 1 s sleep even though they sent PING before it finished.
  *
  * Run: mvn exec:java -Dexec.mainClass="iomodels.eventloop.EventLoopServer"
@@ -29,30 +29,38 @@ public class EventLoopServer {
         serverChannel.configureBlocking(false);
         int port = ((InetSocketAddress) serverChannel.getLocalAddress()).getPort();
         System.out.println("[Server] EventLoopServer listening on port " + port);
-        System.out.println("[Server] Client-2 will send SLOW_PING — watch all others stall!");
+        System.out.println("[Server] Client-1 will send SLOW_PING — watch all others stall!");
 
         Selector selector = Selector.open();
         serverChannel.register(selector, SelectionKey.OP_ACCEPT);
 
-        // Shutdown after 8 s (longer to let starvation fully play out)
+        // Shutdown after 8 s — needs selector.wakeup() to unblock select()
         Thread shutdown = new Thread(() -> {
-            try {
-                Thread.sleep(8_000);
-                System.out.println("[Server] Shutting down...");
-                running = false;
-                selector.wakeup();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            try { Thread.sleep(8_000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            System.out.println("[Server] Shutting down...");
+            running = false;
+            selector.wakeup();
         });
         shutdown.setDaemon(true);
         shutdown.start();
 
-        // 5 staggered clients; client #2 sends SLOW_PING
-        for (int i = 0; i < 5; i++) {
-            final int clientId = i;
+        // 3 staggered clients; client-1 sends SLOW_PING
+        for (int i = 0; i < 3; i++) {
+            final int id = i;
             Thread.sleep(200);
-            new Thread(() -> runClient(port, clientId), "Client-" + clientId).start();
+            new Thread(() -> {
+                boolean isSlow = (id == 1);
+                String msg = isSlow ? "SLOW_PING" : "PING";
+                try (Socket s = new Socket("localhost", port);
+                     PrintWriter out = new PrintWriter(s.getOutputStream(), true);
+                     BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream()))) {
+                    System.out.println("[Client-" + id + "] → " + msg + " at " + Instant.now());
+                    out.println(msg);
+                    System.out.println("[Client-" + id + "] ← " + in.readLine() + " at " + Instant.now());
+                } catch (Exception e) {
+                    System.out.println("[Client-" + id + "] error: " + e.getMessage());
+                }
+            }, "Client-" + i).start();
         }
 
         // Single-thread event loop — everything inline, no pool
@@ -66,7 +74,7 @@ public class EventLoopServer {
                 if (key.isAcceptable()) {
                     handleAccept(key, selector);
                 } else if (key.isReadable()) {
-                    handleReadAndProcess(key); // blocking work done inline!
+                    handleReadAndProcess(key); // all work inline — no hand-off
                 }
             }
         }
@@ -81,76 +89,41 @@ public class EventLoopServer {
         SocketChannel client = server.accept();
         if (client == null) return;
         client.configureBlocking(false);
-        SelectionKey readKey = client.register(selector, SelectionKey.OP_READ);
-        readKey.attach(ByteBuffer.allocate(256));
+        client.register(selector, SelectionKey.OP_READ, ByteBuffer.allocate(256));
         System.out.println("[EventLoop] accepted connection from " + client.getRemoteAddress());
     }
 
     private static void handleReadAndProcess(SelectionKey key) throws IOException {
         SocketChannel channel = (SocketChannel) key.channel();
         ByteBuffer buf = (ByteBuffer) key.attachment();
-        buf.clear();
-
-        int bytesRead;
-        try {
-            bytesRead = channel.read(buf);
-        } catch (IOException e) {
-            key.cancel();
-            channel.close();
-            return;
-        }
-
-        if (bytesRead == -1) {
-            key.cancel();
-            channel.close();
-            return;
-        }
-
-        if (bytesRead == 0) return;
-
-        buf.flip();
-        byte[] data = new byte[buf.limit()];
-        buf.get(data);
-        String message = new String(data, StandardCharsets.UTF_8).trim();
+        String message = readMessage(channel, buf);
+        if (message == null) { key.cancel(); channel.close(); return; }
+        if (message.isEmpty()) return;
 
         if (message.contains("SLOW")) {
-            System.out.println("[EventLoop] SLOW request received at " + Instant.now()
-                    + " — sleeping 1000ms — ALL connections blocked!");
-            try {
-                Thread.sleep(1_000);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            System.out.println("[EventLoop] SLOW request at " + Instant.now() + " — sleeping 1000ms — ALL connections blocked!"); // blocks the ONLY thread — zero events processed for 1s
+            try { Thread.sleep(1_000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
             System.out.println("[EventLoop] slow processing done at " + Instant.now());
         } else {
             System.out.println("[EventLoop] processing: " + message + " at " + Instant.now());
         }
 
-        // Echo back inline
         try {
-            byte[] response = (message + "\n").getBytes(StandardCharsets.UTF_8);
-            channel.write(ByteBuffer.wrap(response));
+            channel.write(ByteBuffer.wrap((message + "\n").getBytes(StandardCharsets.UTF_8)));
         } catch (IOException e) {
             // Client disconnected
         }
     }
 
-    private static void runClient(int port, int id) {
-        boolean isSlow = (id == 2);
-        try (Socket socket = new Socket("localhost", port);
-             PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
-
-            for (int i = 0; i < 3; i++) {
-                String msg = isSlow ? "SLOW_PING" : "PING";
-                System.out.println("[Client-" + id + "] sending " + msg + " at " + Instant.now());
-                out.println(msg);
-                String reply = in.readLine();
-                System.out.println("[Client-" + id + "] received: " + reply + " at " + Instant.now());
-                Thread.sleep(500);
-            }
-        } catch (Exception e) {
-            System.out.println("[Client-" + id + "] error: " + e.getMessage());
-        }
+    /** Reads one message from the channel. Returns null on EOF/error, empty string on no data. */
+    private static String readMessage(SocketChannel channel, ByteBuffer buf) throws IOException {
+        buf.clear();
+        int n = channel.read(buf);
+        if (n == -1) return null;
+        if (n == 0) return "";
+        buf.flip();
+        byte[] data = new byte[buf.limit()];
+        buf.get(data);
+        return new String(data, StandardCharsets.UTF_8).trim();
     }
 }

@@ -12,48 +12,44 @@ import java.util.concurrent.*;
  */
 public class BlockingIOServer {
 
-    private static volatile boolean running = true;
-
     public static void main(String[] args) throws Exception {
         ServerSocket serverSocket = new ServerSocket(0); // OS picks port
+        serverSocket.setSoTimeout(5_000);                // accept loop exits after 5 s idle
         int port = serverSocket.getLocalPort();
         System.out.println("[Server] BlockingIOServer listening on port " + port);
 
         ExecutorService pool = Executors.newFixedThreadPool(10);
 
-        // Shutdown after 5 s
-        Thread shutdown = new Thread(() -> {
-            try {
-                Thread.sleep(5_000);
-                System.out.println("[Server] Shutting down...");
-                running = false;
-                serverSocket.close();
-            } catch (Exception e) {
-                Thread.currentThread().interrupt();
-            }
-        });
-        shutdown.setDaemon(true);
-        shutdown.start();
-
-        // 5 client threads staggered 200 ms apart
-        for (int i = 0; i < 5; i++) {
-            final int clientId = i;
+        // 3 staggered clients, 1 PING each
+        for (int i = 0; i < 3; i++) {
+            final int id = i;
             Thread.sleep(200);
-            new Thread(() -> runClient(port, clientId), "Client-" + clientId).start();
+            new Thread(() -> {
+                try (Socket s = new Socket("localhost", port);
+                     PrintWriter out = new PrintWriter(s.getOutputStream(), true);
+                     BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream()))) {
+                    System.out.println("[Client-" + id + "] → PING");
+                    out.println("PING");
+                    System.out.println("[Client-" + id + "] ← " + in.readLine());
+                } catch (Exception e) {
+                    System.out.println("[Client-" + id + "] error: " + e.getMessage());
+                }
+            }, "Client-" + i).start();
         }
 
-        // Accept loop
-        while (running) {
+        // Accept loop — one thread per connection
+        while (true) {
             try {
                 Socket conn = serverSocket.accept();
-                pool.submit(() -> handleConnection(conn));
-            } catch (SocketException e) {
-                break; // serverSocket.close() called by shutdown thread
+                pool.submit(() -> handleConnection(conn)); // one thread per connection
+            } catch (SocketTimeoutException e) {
+                break; // 5 s with no new connections — we're done
             }
         }
 
         pool.shutdown();
         pool.awaitTermination(3, TimeUnit.SECONDS);
+        serverSocket.close();
         System.out.println("[Server] Done.");
     }
 
@@ -64,30 +60,12 @@ public class BlockingIOServer {
              PrintWriter out = new PrintWriter(socket.getOutputStream(), true)) {
 
             String line;
-            while ((line = in.readLine()) != null) {
+            while ((line = in.readLine()) != null) { // blocks this thread until data arrives
                 System.out.println("[" + thread + "] echoed: " + line);
                 out.println(line);
             }
         } catch (IOException e) {
             // Client disconnected
-        }
-    }
-
-    private static void runClient(int port, int id) {
-        try (Socket socket = new Socket("localhost", port);
-             PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
-
-            for (int i = 0; i < 3; i++) {
-                String msg = "PING";
-                System.out.println("[Client-" + id + "] sending " + msg);
-                out.println(msg);
-                String reply = in.readLine();
-                System.out.println("[Client-" + id + "] received: " + reply);
-                Thread.sleep(500);
-            }
-        } catch (Exception e) {
-            System.out.println("[Client-" + id + "] error: " + e.getMessage());
         }
     }
 }

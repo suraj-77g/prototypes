@@ -31,28 +31,34 @@ public class NioWorkerPoolServer {
 
         ExecutorService workerPool = Executors.newFixedThreadPool(4);
 
-        // Shutdown after 5 s
+        // Shutdown after 5 s — needs selector.wakeup() to unblock select()
         Thread shutdown = new Thread(() -> {
-            try {
-                Thread.sleep(5_000);
-                System.out.println("[Server] Shutting down...");
-                running = false;
-                selector.wakeup();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            try { Thread.sleep(5_000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            System.out.println("[Server] Shutting down...");
+            running = false;
+            selector.wakeup();
         });
         shutdown.setDaemon(true);
         shutdown.start();
 
-        // 5 staggered clients
-        for (int i = 0; i < 5; i++) {
-            final int clientId = i;
+        // 3 staggered clients, 1 PING each
+        for (int i = 0; i < 3; i++) {
+            final int id = i;
             Thread.sleep(200);
-            new Thread(() -> runClient(port, clientId), "Client-" + clientId).start();
+            new Thread(() -> {
+                try (Socket s = new Socket("localhost", port);
+                     PrintWriter out = new PrintWriter(s.getOutputStream(), true);
+                     BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream()))) {
+                    System.out.println("[Client-" + id + "] → PING");
+                    out.println("PING");
+                    System.out.println("[Client-" + id + "] ← " + in.readLine());
+                } catch (Exception e) {
+                    System.out.println("[Client-" + id + "] error: " + e.getMessage());
+                }
+            }, "Client-" + i).start();
         }
 
-        // IO event loop — runs on main thread
+        // IO event loop — single IO thread handles all events
         while (running) {
             selector.select(100);
             Iterator<SelectionKey> keys = selector.selectedKeys().iterator();
@@ -80,77 +86,46 @@ public class NioWorkerPoolServer {
         SocketChannel client = server.accept();
         if (client == null) return;
         client.configureBlocking(false);
-        SelectionKey readKey = client.register(selector, SelectionKey.OP_READ);
-        readKey.attach(ByteBuffer.allocate(256));
+        client.register(selector, SelectionKey.OP_READ, ByteBuffer.allocate(256));
         System.out.println("[IO Thread] accepted connection from " + client.getRemoteAddress());
     }
 
     private static void handleRead(SelectionKey key, ExecutorService pool) throws IOException {
         SocketChannel channel = (SocketChannel) key.channel();
         ByteBuffer buf = (ByteBuffer) key.attachment();
-        buf.clear();
-
-        int bytesRead;
-        try {
-            bytesRead = channel.read(buf);
-        } catch (IOException e) {
-            key.cancel();
-            channel.close();
-            return;
-        }
-
-        if (bytesRead == -1) {
-            key.cancel();
-            channel.close();
-            return;
-        }
-
-        if (bytesRead == 0) return;
-
-        buf.flip();
-        byte[] data = new byte[buf.limit()];
-        buf.get(data);
-        String message = new String(data, StandardCharsets.UTF_8).trim();
+        String message = readMessage(channel, buf);
+        if (message == null) { key.cancel(); channel.close(); return; }
+        if (message.isEmpty()) return;
 
         System.out.println("[IO Thread] dispatching to worker pool: " + message);
+        key.interestOps(0); // pause reads while worker owns the channel
 
-        // Deregister read interest while worker processes to avoid re-entry
-        key.interestOps(0);
-
-        pool.submit(() -> {
+        pool.submit(() -> { // hand off to worker — IO thread is free immediately
             processRequest(channel, message);
-            // Re-enable read interest after processing
             key.interestOps(SelectionKey.OP_READ);
             key.selector().wakeup();
         });
+    }
+
+    /** Reads one message from the channel. Returns null on EOF/error, empty string on no data. */
+    private static String readMessage(SocketChannel channel, ByteBuffer buf) throws IOException {
+        buf.clear();
+        int n = channel.read(buf);
+        if (n == -1) return null;
+        if (n == 0) return "";
+        buf.flip();
+        byte[] data = new byte[buf.limit()];
+        buf.get(data);
+        return new String(data, StandardCharsets.UTF_8).trim();
     }
 
     private static void processRequest(SocketChannel channel, String message) {
         String thread = Thread.currentThread().getName();
         System.out.println("[" + thread + "] processing: " + message);
         try {
-            byte[] response = (message + "\n").getBytes(StandardCharsets.UTF_8);
-            channel.write(ByteBuffer.wrap(response));
+            channel.write(ByteBuffer.wrap((message + "\n").getBytes(StandardCharsets.UTF_8)));
         } catch (IOException e) {
             // Client disconnected
-        }
-    }
-
-    private static void runClient(int port, int id) {
-        try (Socket socket = new Socket("localhost", port);
-             PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
-
-            for (int i = 0; i < 3; i++) {
-                String msg = "PING";
-                System.out.println("[Client-" + id + "] sending " + msg);
-                out.println(msg);
-                String reply = in.readLine();
-                System.out.println("[Client-" + id + "] received: " + reply);
-                Thread.sleep(500);
-            }
-        } catch (Exception e) {
-            System.out.println("[Client-" + id + "] error: " + e.getMessage());
         }
     }
 }
