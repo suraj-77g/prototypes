@@ -1,4 +1,4 @@
-package org.srj.concurrency.blockingqueueimpl;
+package concurrency;
 
 import java.util.LinkedList;
 import java.util.Queue;

@@ -15,7 +15,7 @@ mvn clean compile
 mvn exec:java -Dexec.mainClass="zerocopy.ZeroCopyDemo"
 
 # Blocking queue producer-consumer demo
-mvn exec:java -Dexec.mainClass="org.srj.concurrency.blockingqueueimpl.Main"
+mvn exec:java -Dexec.mainClass="concurrency.Main"
 
 # I/O Models demos (all 3 run sequentially)
 mvn exec:java -Dexec.mainClass="iomodels.Main"
